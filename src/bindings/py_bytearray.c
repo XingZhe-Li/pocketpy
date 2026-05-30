@@ -5,6 +5,9 @@
 #include "pocketpy/common/sstream.h"
 #include <stdbool.h>
 
+static bool bytearray__iter__(int argc, py_Ref argv);
+bool bytearray_iterator__next__(int argc, py_Ref argv);
+
 static c11_vector* bytearray__vec(py_Ref self) {
     return (c11_vector*)PyObject__userdata(self->_obj);
 }
@@ -423,6 +426,7 @@ py_Type pk_bytearray__register() {
     py_bindmagic(tp_bytearray, __ne__, bytearray__ne__);
     py_bindmagic(tp_bytearray, __add__, bytearray__add__);
     py_bindmagic(tp_bytearray, __contains__, bytearray__contains__);
+    py_bindmagic(tp_bytearray, __iter__, bytearray__iter__);
 
     py_bindmethod(tp_bytearray, "append", bytearray_append);
     py_bindmethod(tp_bytearray, "extend", bytearray_extend);
@@ -437,4 +441,30 @@ py_Type pk_bytearray__register() {
     py_bindmethod(tp_bytearray, "find", bytearray_find);
 
     return tp_bytearray;
+}
+
+static bool bytearray__iter__(int argc, py_Ref argv) {
+    PY_CHECK_ARGC(1);
+    int* ud = py_newobject(py_retval(), tp_bytearray_iterator, 1, sizeof(int));
+    *ud = 0;
+    py_setslot(py_retval(), 0, argv);  // keep a reference to the bytearray
+    return true;
+}
+
+bool bytearray_iterator__next__(int argc, py_Ref argv) {
+    PY_CHECK_ARGC(1);
+    int* ud = py_touserdata(&argv[0]);
+    py_Ref ba = py_getslot(argv, 0);
+    c11_vector* self = bytearray__vec(ba);
+    if(*ud >= self->length) return StopIteration();
+    py_newint(py_retval(), c11__getitem(unsigned char, self, *ud));
+    (*ud)++;
+    return true;
+}
+
+py_Type pk_bytearray_iterator__register() {
+    py_Type type = pk_newtype("bytearray_iterator", tp_object, NULL, NULL, false, true);
+    py_bindmagic(type, __iter__, pk_wrapper__self);
+    py_bindmagic(type, __next__, bytearray_iterator__next__);
+    return type;
 }

@@ -165,3 +165,30 @@ assert len(ba) == 101
 assert ba[0] == 0
 assert ba[50] == 49
 assert ba[100] == 99
+
+# iteration
+result = []
+for b in bytearray(b'ABC'):
+    result.append(b)
+assert result == [65, 66, 67]
+
+# list comprehension
+result = [b for b in bytearray(b'\x01\x02\x03')]
+assert result == [1, 2, 3]
+
+# iteration over empty
+count = 0
+for b in bytearray():
+    count += 1
+assert count == 0
+
+# iteration after mutation
+ba = bytearray(b'hello')
+ba[0] = 72  # 'H'
+result = [b for b in ba]
+assert result == [72, 101, 108, 108, 111]
+
+# iterator from iter()
+it = iter(bytearray(b'XY'))
+assert next(it) == 88
+assert next(it) == 89

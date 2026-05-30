@@ -844,6 +844,7 @@ enum py_PredefinedType {
     tp_Exception,
     tp_bytes,
     tp_bytearray,
+    tp_bytearray_iterator,
     tp_namedict,
     tp_locals,
     tp_code,
