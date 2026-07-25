@@ -5,7 +5,14 @@
 #include "pocketpy/common/name.h"
 #include "pocketpy/interpreter/vm.h"
 
-_Thread_local VM* pk_current_vm;
+_Thread_local VM* pk_current_vm_storage;
+/*
+ * Reads must go through `pk_current_vm` (which is a macro calling the
+ * pure inline getter declared in base.h). Writes are only performed
+ * here and directly touch the storage.
+ */
+#undef pk_current_vm
+#define pk_current_vm pk_current_vm_storage
 
 static bool pk_initialized;
 static bool pk_finalized;

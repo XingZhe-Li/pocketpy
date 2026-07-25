@@ -11,6 +11,67 @@
 #include <assert.h>
 #include <time.h>
 
+/*
+ * Hot-path helper overrides
+ * -------------------------
+ *
+ * Several public helpers such as `py_retval`, `py_push`, `py_pop`,
+ * `py_pushmethod` and `py_vectorcall` read `pk_current_vm` internally
+ * so callers don't have to pass a VM around. Inside the bytecode
+ * interpreter we ALREADY have the VM in the `self` parameter, so
+ * every one of those reads is redundant.
+ *
+ * On MinGW-GCC (built with `--enable-threads=posix`), reading
+ * `pk_current_vm` compiles down to a `__emutls_get_address()` function
+ * call. Before this override, the interpreter's main function
+ * (`VM__run_top_frame`) issued 26 such emutls calls per pass through
+ * the switch -- that emutls overhead was the single biggest reason
+ * GCC-built binaries were ~2x slower than Clang-built ones on
+ * Windows (Clang uses native `%gs:0x58` TLS instead).
+ *
+ * The macros below shadow the public helper names within this
+ * translation unit only; external callers keep the original,
+ * TLS-based API. `self` here is the local `VM*` parameter of
+ * `VM__run_top_frame`, which is why these macros live below the
+ * function's local scope but before the helpers are invoked.
+ */
+#define py_retval()             (&self->last_retval)
+#define py_push(v)              do { *self->stack.sp = *(v); self->stack.sp++; } while(0)
+#define py_pushnil()            (py_newnil(self->stack.sp++))
+#define py_pushnone()           (py_newnone(self->stack.sp++))
+#define py_pushtmp()            (self->stack.sp++)
+#define py_pop()                (self->stack.sp--)
+#define py_peek(i)              (self->stack.sp + (i))
+#define py_shrink(n)            (self->stack.sp -= (n))
+#define py_vectorcall(argc, kwargc)                                                                \
+    (VM__vectorcall(self, (argc), (kwargc), false) != RES_ERROR)
+#define py_pushmethod(name)                                                                        \
+    (pk_loadmethod(self->stack.sp - 1, (name)) ? (self->stack.sp++, true) : false)
+
+/*
+ * `pk_typeinfo` and `py_tpfindmagic` both start with a
+ * `pk_current_vm->types.data[t].ti` lookup. Overriding them here lets
+ * ceval use `self->types` directly and eliminates one more TLS read
+ * per magic-method dispatch (BINARY/COMPARE/SUBSCR/CONTAINS opcodes).
+ */
+#define pk_typeinfo(type) (((TypePointer*)self->types.data)[(type)].ti)
+#define py_tpfindmagic(t, name) (pk_tpfindname(pk_typeinfo(t), (name)))
+
+/*
+ * Fast-path `py_bool` for `POP_JUMP_IF_*` / `JUMP_IF_*_OR_POP`. The
+ * result of a COMPARE_* / IS_OP / CONTAINS_OP is always tp_bool, so
+ * we can skip the whole `py_bool` function-call dance (which alone
+ * costs several dozen instructions per iteration in the primes.py
+ * inner loop). The general fallback via `py_bool(ref)` is still used
+ * inside the macro when the runtime type is not one of the common
+ * quick-answer cases.
+ */
+#define pk_bool_fast(ref)                                                                          \
+    ((ref)->type == tp_bool     ? (int)(ref)->_bool                                                \
+     : (ref)->type == tp_int    ? (int)((ref)->_i64 != 0)                                          \
+     : (ref)->type == tp_NoneType ? 0                                                              \
+                                : py_bool(ref))
+
 #define DISPATCH()                                                                                 \
     do {                                                                                           \
         frame->ip++;                                                                               \
@@ -716,21 +777,21 @@ __NEXT_STEP:
             DISPATCH();
         }
         case OP_POP_JUMP_IF_FALSE: {
-            int res = py_bool(TOP());
+            int res = pk_bool_fast(TOP());
             if(res < 0) goto __ERROR;
             POP();
             if(!res) DISPATCH_JUMP((int16_t)byte.arg);
             DISPATCH();
         }
         case OP_POP_JUMP_IF_TRUE: {
-            int res = py_bool(TOP());
+            int res = pk_bool_fast(TOP());
             if(res < 0) goto __ERROR;
             POP();
             if(res) DISPATCH_JUMP((int16_t)byte.arg);
             DISPATCH();
         }
         case OP_JUMP_IF_TRUE_OR_POP: {
-            int res = py_bool(TOP());
+            int res = pk_bool_fast(TOP());
             if(res < 0) goto __ERROR;
             if(res) {
                 DISPATCH_JUMP((int16_t)byte.arg);
@@ -740,7 +801,7 @@ __NEXT_STEP:
             }
         }
         case OP_JUMP_IF_FALSE_OR_POP: {
-            int res = py_bool(TOP());
+            int res = pk_bool_fast(TOP());
             if(res < 0) goto __ERROR;
             if(!res) {
                 DISPATCH_JUMP((int16_t)byte.arg);
@@ -750,7 +811,7 @@ __NEXT_STEP:
             }
         }
         case OP_SHORTCUT_IF_FALSE_OR_POP: {
-            int res = py_bool(TOP());
+            int res = pk_bool_fast(TOP());
             if(res < 0) goto __ERROR;
             if(!res) {                      // [b, False]
                 STACK_SHRINK(2);            // []
@@ -1530,3 +1591,19 @@ bool pk_format_object(VM* self, py_Ref val, c11_sv spec) {
 #undef INSERT_THIRD
 #undef vectorcall_opcall
 #undef RESET_CO_CACHE
+
+/* Restore the public hot-path helpers for the rest of the translation
+ * unit (needed for the unity build where the file is concatenated). */
+#undef py_retval
+#undef py_push
+#undef py_pushnil
+#undef py_pushnone
+#undef py_pushtmp
+#undef py_pop
+#undef py_peek
+#undef py_shrink
+#undef py_vectorcall
+#undef py_pushmethod
+#undef pk_typeinfo
+#undef py_tpfindmagic
+#undef pk_bool_fast

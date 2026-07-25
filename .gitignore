@@ -24,6 +24,7 @@ pocketpy.exp
 pocketpy.lib
 APPS
 build
+build_*
 
 main
 *.dSYM
