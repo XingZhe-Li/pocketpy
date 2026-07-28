@@ -5,7 +5,41 @@
 #include "pocketpy/common/name.h"
 #include "pocketpy/interpreter/vm.h"
 
-PK_THREAD_LOCAL VM* pk_current_vm;
+PK_THREAD_LOCAL VM* pk_current_vm_storage;
+/*
+ * Reads must go through `pk_current_vm` (which is a macro calling the
+ * getter declared in base.h). Writes are only performed here
+ * and directly touch the storage.
+ */
+#undef pk_current_vm
+#define pk_current_vm pk_current_vm_storage
+
+#if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+    pk_vm_tid_cache_entry pk_vm_tid_cache[PK_VM_TID_CACHE_SIZE];
+
+    static inline uint32_t pk_read_tid(void) {
+        uint32_t tid;
+        __asm__ __volatile__ ("mov %%gs:0x48, %0" : "=r"(tid));
+        return tid;
+    }
+
+    VM* pk_getvm_slow(unsigned slot, uint32_t tid) {
+        VM* v = pk_current_vm_storage;
+        pk_vm_tid_cache[slot].tid = tid;
+        pk_vm_tid_cache[slot].vm  = v;
+        return v;
+    }
+
+    VM* pk_getvm(void) {
+        uint32_t tid = pk_read_tid();
+        unsigned slot = tid & (PK_VM_TID_CACHE_SIZE - 1);
+        pk_vm_tid_cache_entry e = pk_vm_tid_cache[slot];
+        if (__builtin_expect(e.tid == tid, 1)) return e.vm;
+        return pk_getvm_slow(slot, tid);
+    }
+#else
+    VM* pk_getvm(void) { return pk_current_vm_storage; }
+#endif
 
 static bool pk_initialized;
 static bool pk_finalized;
