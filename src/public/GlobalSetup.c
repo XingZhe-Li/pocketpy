@@ -14,6 +14,18 @@ _Thread_local VM* pk_current_vm_storage;
 #undef pk_current_vm
 #define pk_current_vm pk_current_vm_storage
 
+#if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+    /* Inline cache for pk_getvm(); see include/pocketpy/objects/base.h */
+    pk_vm_tid_cache_entry pk_vm_tid_cache[PK_VM_TID_CACHE_SIZE];
+
+    VM* pk_getvm_slow(unsigned slot, uint32_t tid) {
+        VM* v = pk_current_vm_storage;
+        pk_vm_tid_cache[slot].tid = tid;
+        pk_vm_tid_cache[slot].vm  = v;
+        return v;
+    }
+#endif
+
 static bool pk_initialized;
 static bool pk_finalized;
 

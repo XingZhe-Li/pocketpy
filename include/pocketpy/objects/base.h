@@ -6,52 +6,62 @@ typedef struct PyObject PyObject;
 typedef struct VM VM;
 
 /*
- * `pk_current_vm` holds the currently-active VM for the calling thread.
- * On Linux/Clang/MSVC it is a native TLS variable that compiles down to a
- * single `%gs:0x58` (or `%fs:...`) indirection, so accesses are cheap. On
- * MinGW-GCC (which is built with `--enable-threads=posix`), however,
- * `_Thread_local` is implemented via *emulated* TLS -- every read
- * expands into a call to `__emutls_get_address()`. Because the bytecode
- * interpreter reads `pk_current_vm` many times per opcode (via
- * `py_retval`, `pk_typeinfo`, `py_push*`, ...), this used to be the
- * dominant cause of the ~2x runtime gap between GCC- and Clang-built
- * binaries on Windows.
+ * Experimental: TID-keyed inline cache for `pk_current_vm`.
  *
- * We can't ask GCC to switch away from emutls, but we CAN tell it that
- * reading the TLS slot is a *pure* operation (no observable side
- * effects, result depends only on TLS state which does not change
- * during a normal function). GCC will then hoist and CSE repeated
- * reads inside the same function, turning N emutls calls per hot
- * function into 1.
+ * pk_current_vm is a `_Thread_local` pointer. On MinGW-GCC (posix threads)
+ * every read expands into a `__emutls_get_address()` function call, and
+ * because pocketpy's dispatch loop is a switch with many entry points via
+ * fall-through / `goto __ERROR`, GCC cannot CSE those calls -- every opcode
+ * handler that touches `pk_current_vm` pays the emutls tax.
  *
- * All reads should go through `pk_current_vm` (which is now a macro
- * that calls a pure inline getter). The raw storage lives in
- * `pk_current_vm_storage` and only `GlobalSetup.c` writes to it.
+ * Idea: read the current thread id straight from the TIB (`%gs:0x48`),
+ * index into a tiny direct-mapped cache indexed by low bits of the tid,
+ * and if the cache hits, return the stored VM pointer with zero function
+ * calls. Slow-path (mismatched or empty slot) falls back to the real TLS
+ * variable and refreshes the cache.
+ *
+ * The cache is a plain (non-TLS) global -- entries are simple TID/VM
+ * pairs, so misidentification is impossible: worst case we refresh
+ * from the ground-truth TLS variable.
  */
 extern _Thread_local VM* pk_current_vm_storage;
 
-/*
- * Marked `const` (not just `pure`) so GCC treats the read as fully
- * CSE-able even across other function calls: within a normal call
- * chain `pk_current_vm_storage` doesn't change unless the caller
- * explicitly invokes `py_switchvm` / `py_resetvm`, and those are
- * cold-path operations that are never mixed with `pk_current_vm`
- * reads on the same execution path. Callers that DO need a fresh
- * read after switching must read `pk_current_vm_storage` directly.
- *
- * We deliberately keep this `static inline` (per-TU copy) so that the
- * `const` attribute stays visible at every call site without any ODR
- * complications with the DLL-exported wrappers like `py_retval`.
- */
-#if defined(__GNUC__) || defined(__clang__)
-    __attribute__((const, always_inline))
-    static inline VM* pk_getvm(void) { return pk_current_vm_storage; }
+#define PK_VM_TID_CACHE_BITS 4
+#define PK_VM_TID_CACHE_SIZE (1 << PK_VM_TID_CACHE_BITS)
+
+typedef struct pk_vm_tid_cache_entry {
+    uint32_t tid;
+    VM* vm;
+} pk_vm_tid_cache_entry;
+
+extern pk_vm_tid_cache_entry pk_vm_tid_cache[PK_VM_TID_CACHE_SIZE];
+
+#if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+    /* Slow path: refill cache from the actual TLS. Kept out-of-line so it
+     * does not bloat every call site. */
+    __attribute__((noinline))
+    VM* pk_getvm_slow(unsigned slot, uint32_t tid);
+
+    __attribute__((always_inline))
+    static inline uint32_t pk_read_tid(void) {
+        uint32_t tid;
+        __asm__ __volatile__ ("mov %%gs:0x48, %0" : "=r"(tid));
+        return tid;
+    }
+
+    __attribute__((always_inline))
+    static inline VM* pk_getvm(void) {
+        uint32_t tid = pk_read_tid();
+        unsigned slot = tid & (PK_VM_TID_CACHE_SIZE - 1);
+        pk_vm_tid_cache_entry e = pk_vm_tid_cache[slot];
+        if (__builtin_expect(e.tid == tid, 1)) return e.vm;
+        return pk_getvm_slow(slot, tid);
+    }
 #else
     static inline VM* pk_getvm(void) { return pk_current_vm_storage; }
 #endif
 
 #define pk_current_vm (pk_getvm())
-
 typedef struct py_TValue {
     py_Type type;
     bool is_ptr;
